@@ -11,7 +11,13 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from . import packing, service
 from .db import connect, database_path, init_db
-from .models import Health, Manifest, ManifestList, TicketLimitError
+from .models import (
+    DetailConflictError,
+    Health,
+    Manifest,
+    ManifestList,
+    TicketLimitError,
+)
 
 CSV_MEDIA_TYPE = "text/csv; charset=utf-8"
 
@@ -84,6 +90,24 @@ async def handle_ticket_too_large(
     return JSONResponse(status_code=422, content=payload.model_dump())
 
 
+@app.exception_handler(service.DetailConflict)
+async def handle_detail_conflict(
+    request: Request, exc: service.DetailConflict
+) -> JSONResponse:
+    payload = DetailConflictError.model_validate(
+        {
+            "detail": {
+                "message": str(exc),
+                "conflicts": [
+                    {"ticket_no": ticket_no, "batch_id": batch_id}
+                    for ticket_no, batch_id in exc.conflicts
+                ],
+            }
+        }
+    )
+    return JSONResponse(status_code=409, content=payload.model_dump())
+
+
 @app.get("/health", response_model=Health, tags=["ops"])
 def health(conn: sqlite3.Connection = Depends(get_db)) -> Health:
     conn.execute("SELECT 1").fetchone()
@@ -98,7 +122,11 @@ def health(conn: sqlite3.Connection = Depends(get_db)) -> Health:
         422: {
             "model": TicketLimitError,
             "description": "某工单连接行数超过每包上限，本次不发布",
-        }
+        },
+        409: {
+            "model": DetailConflictError,
+            "description": "与其它批次现行清单共有的工单号明细不一致，本次不发布",
+        },
     },
     tags=["publish"],
 )
@@ -114,6 +142,12 @@ def publish_batch(
     两表按工单号左连接，重复行各自保留，无换件的工单行也保留。任一工单
     连接后的行数超过上限时返回 422（含工单号与连接行数），本批不写库，
     原清单继续有效。
+
+    发布前将本次提交的工单号与其他批次现行清单中的工单号取交集做核对：
+    按下载 CSV 内容（忽略行序、重复行按次数、无换件按空零件码）比较，只
+    比对共有工单号，不展开连接明细。任一共有工单号明细不一致时返回 409，
+    给出冲突工单号与对方批次，本次不写库，双方原清单继续有效；工单号互不
+    重叠的批次照常发布。
     """
     batch = service.require_batch_id(batch_id)
     limit = service.parse_row_limit(row_limit)

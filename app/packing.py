@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import csv
 import io
+from collections import Counter
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence, Tuple
+from functools import reduce
+from math import gcd
+from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
 TICKET_HEADER = ("ticket_no", "station")
 PARTS_HEADER = ("ticket_no", "part_code")
@@ -165,6 +168,64 @@ def group_counts(tickets: Sequence[Ticket], parts: Sequence[Part]) -> Dict[str, 
         ticket_no: count * part_rows.get(ticket_no, 1)
         for ticket_no, count in ticket_rows.items()
     }
+
+
+# A ticket line with no replacement part downloads with an empty part code.
+EMPTY_PART_CODE = ""
+
+
+def _normalized_counts(counts: Mapping[str, int]) -> Tuple[Tuple[str, int], ...]:
+    """Reduce a count map to a scale-free, order-independent canonical form."""
+    values = [count for count in counts.values() if count]
+    if not values:
+        return ()
+    divisor = reduce(gcd, values)
+    return tuple(
+        sorted((str(key), count // divisor) for key, count in counts.items() if count)
+    )
+
+
+def detail_fingerprint_from_counts(
+    station_counts: Mapping[str, int],
+    part_code_counts: Mapping[str, int] | None,
+) -> Tuple[Tuple[Tuple[str, int], ...], Tuple[Tuple[str, int], ...], int]:
+    """Canonical form of one ticket number's downloaded detail rows.
+
+    A ticket number's left join is the outer product of its submitted rows
+    (grouped by station) and its part lines (grouped by part code); with no
+    part line, each submitted row appears once with an empty part code. The
+    downloaded rows are therefore fully described by those two count maps --
+    row order is irrelevant and duplicate rows keep their multiplicity. This
+    function returns a canonical form that is equal for two ticket numbers
+    exactly when they download the same rows as a multiset:
+
+    * the station counts scaled down by their common divisor,
+    * the part-code counts scaled down the same way,
+    * the total number of downloaded rows.
+
+    Because both sides are normalized independently, ``2 rows x 1 part`` and
+    ``1 row x 2 parts`` compare equal (both download the same two rows), yet
+    the pair ``(normalized counts, total rows)`` still pins down the outer
+    product exactly. Only per-value counts are kept, so the ``rows x parts``
+    joined detail is never materialized.
+    """
+    codes = part_code_counts if part_code_counts else {EMPTY_PART_CODE: 1}
+    total_rows = sum(station_counts.values()) * sum(codes.values())
+    return (
+        _normalized_counts(station_counts),
+        _normalized_counts(codes),
+        total_rows,
+    )
+
+
+def detail_fingerprint(
+    stations: Iterable[str], part_codes: Iterable[str]
+) -> Tuple[Tuple[Tuple[str, int], ...], Tuple[Tuple[str, int], ...], int]:
+    """Convenience wrapper around :func:`detail_fingerprint_from_counts`."""
+    codes = list(part_codes)
+    return detail_fingerprint_from_counts(
+        dict(Counter(stations)), dict(Counter(codes)) if codes else None
+    )
 
 
 def plan(

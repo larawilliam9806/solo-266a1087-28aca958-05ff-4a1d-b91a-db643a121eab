@@ -354,13 +354,31 @@ def test_concurrent_publishes_are_serialized_per_batch(client):
         assert body[1] == ["T1", "S1", f"P{index}"]
 
 
-def test_download_does_not_include_other_batches_same_ticket_numbers(client):
+def test_download_does_not_include_other_batches_rows(client):
     publish(client, batch="b1", tickets="ticket_no,station\nT1,S1\n",
             parts="ticket_no,part_code\nT1,P1\n", row_limit="10")
-    publish(client, batch="b2", tickets="ticket_no,station\nT1,S1\n",
-            parts="ticket_no,part_code\nT1,P2\n", row_limit="10")
+    publish(client, batch="b2", tickets="ticket_no,station\nT9,S9\n",
+            parts="ticket_no,part_code\nT9,P9\n", row_limit="10")
 
     v1 = client.get("/api/batches/b1/manifests/latest").json()
     v2 = client.get("/api/batches/b2/manifests/latest").json()
     assert rows(client.get(v1["packages"][0]["download_url"]).text)[1] == ["T1", "S1", "P1"]
-    assert rows(client.get(v2["packages"][0]["download_url"]).text)[1] == ["T1", "S1", "P2"]
+    assert rows(client.get(v2["packages"][0]["download_url"]).text)[1] == ["T9", "S9", "P9"]
+
+
+def test_same_ticket_number_with_same_detail_is_accepted_across_batches(client):
+    tickets = "ticket_no,station\nT1,S1\nT1,S1\nT2,S2\n"
+    parts = "ticket_no,part_code\nT1,P1\nT2,P2\n"
+    first = publish(client, batch="b1", tickets=tickets, parts=parts, row_limit="10")
+    second = publish(client, batch="b2", tickets=tickets, parts=parts, row_limit="10")
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+
+    # Each batch keeps serving its own snapshot.
+    for manifest in (first.json(), second.json()):
+        body = rows(client.get(manifest["packages"][0]["download_url"]).text)
+        assert body[1:] == [
+            ["T1", "S1", "P1"],
+            ["T1", "S1", "P1"],
+            ["T2", "S2", "P2"],
+        ]

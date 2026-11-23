@@ -43,6 +43,23 @@ class TicketLimitError(BaseModel):
     detail: TicketLimitExceeded
 
 
+class DetailConflictItem(BaseModel):
+    ticket_no: str = Field(description="与其它批次明细不一致的工单号")
+    batch_id: str = Field(description="现行清单与本次明细不一致的其它批次号")
+
+
+class DetailConflictDetail(BaseModel):
+    error: str = Field(default="ticket_detail_conflict")
+    message: str
+    conflicts: List[DetailConflictItem] = Field(
+        description="按工单号排序的冲突列表，每项给出工单号与对方批次号"
+    )
+
+
+class DetailConflictError(BaseModel):
+    detail: DetailConflictDetail
+
+
 class Health(BaseModel):
     status: str
     database: str

@@ -6,8 +6,9 @@ import csv
 import io
 import re
 import sqlite3
+from collections import Counter
 from datetime import datetime, timezone
-from typing import Iterator, List
+from typing import Dict, Iterator, List, Tuple
 
 from . import packing
 from .db import transaction as db_transaction
@@ -27,6 +28,21 @@ class BadRequest(Exception):
 
 class CorruptSnapshot(Exception):
     pass
+
+
+class DetailConflict(Exception):
+    """Raised when a shared ticket number would download different details.
+
+    ``conflicts`` is sorted by ticket number; each entry holds the ticket
+    number and the other batch's id whose current manifest disagrees.
+    """
+
+    def __init__(self, conflicts: List[Tuple[str, str]]) -> None:
+        super().__init__(
+            "ticket numbers shared with other batches have conflicting details"
+        )
+        self.conflicts = conflicts
+
 
 
 def require_batch_id(batch_id: str | None) -> str:
@@ -50,6 +66,111 @@ def parse_row_limit(raw: str | int | None) -> int:
     return value
 
 
+def _batch_ticket_counts(
+    tickets: List[packing.Ticket], parts: List[packing.Part]
+) -> Tuple[Dict[str, Counter], Dict[str, Counter]]:
+    """Per-ticket station and part-code counts for a submitted batch."""
+    stations: Dict[str, Counter] = {}
+    for ticket in tickets:
+        stations.setdefault(ticket.ticket_no, Counter())[ticket.station] += 1
+    codes: Dict[str, Counter] = {}
+    for part in parts:
+        codes.setdefault(part.ticket_no, Counter())[part.part_code] += 1
+    return stations, codes
+
+
+def _reconcile(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    tickets: List[packing.Ticket],
+    parts: List[packing.Part],
+) -> List[Tuple[str, str]]:
+    """Compare shared ticket numbers with every other batch's current manifest.
+
+    Only ticket numbers present in both this submission and an other batch's
+    current manifest are compared. Each ticket number's detail is reduced to
+    its outer-product fingerprint from the station and part-code counts, so
+    the two-table join is never expanded and the comparison ignores row order
+    while honouring duplicate rows. Batches without a shared ticket number are
+    untouched.
+
+    Must run inside the publishing transaction: ``BEGIN IMMEDIATE`` freezes
+    other batches' current manifests for the duration, so the versions read
+    here are exactly the ones in force when this publish takes effect.
+    ``(ticket_no, other_batch_id)`` pairs are returned sorted, empty when all
+    shared ticket numbers agree.
+    """
+    stations, codes = _batch_ticket_counts(tickets, parts)
+
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS reconcile_latest"
+        " (version TEXT PRIMARY KEY, batch_id TEXT NOT NULL)"
+    )
+    conn.execute("DELETE FROM reconcile_latest")
+    conn.execute(
+        "INSERT INTO reconcile_latest (version, batch_id)"
+        " SELECT m.version, m.batch_id FROM manifests AS m"
+        " JOIN (SELECT batch_id, MAX(seq) AS max_seq FROM manifests GROUP BY batch_id)"
+        "   AS x ON x.batch_id = m.batch_id AND x.max_seq = m.seq"
+        " WHERE m.batch_id != ?",
+        (batch_id,),
+    )
+    batch_by_version = {
+        row["version"]: row["batch_id"]
+        for row in conn.execute("SELECT version, batch_id FROM reconcile_latest")
+    }
+    if not batch_by_version:
+        return []
+
+    # Materialize only the submitted ticket numbers, so the aggregate queries
+    # touch just the overlapping groups.
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS reconcile_tickets"
+        " (ticket_no TEXT PRIMARY KEY)"
+    )
+    conn.execute("DELETE FROM reconcile_tickets")
+    conn.executemany(
+        "INSERT OR IGNORE INTO reconcile_tickets (ticket_no) VALUES (?)",
+        ((ticket.ticket_no,) for ticket in tickets),
+    )
+
+    station_rows = conn.execute(
+        "SELECT t.version, t.ticket_no, t.station, COUNT(*) AS row_count"
+        " FROM tickets AS t"
+        " JOIN reconcile_latest AS l ON l.version = t.version"
+        " WHERE t.ticket_no IN (SELECT ticket_no FROM reconcile_tickets)"
+        " GROUP BY t.version, t.ticket_no, t.station"
+    ).fetchall()
+    part_rows = conn.execute(
+        "SELECT p.version, p.ticket_no, p.part_code, COUNT(*) AS row_count"
+        " FROM parts AS p"
+        " JOIN reconcile_latest AS l ON l.version = p.version"
+        " WHERE p.ticket_no IN (SELECT ticket_no FROM reconcile_tickets)"
+        " GROUP BY p.version, p.ticket_no, p.part_code"
+    ).fetchall()
+
+    other_stations: Dict[Tuple[str, str], Counter] = {}
+    for row in station_rows:
+        key = (row["version"], row["ticket_no"])
+        other_stations.setdefault(key, Counter())[row["station"]] = row["row_count"]
+    other_codes: Dict[Tuple[str, str], Counter] = {}
+    for row in part_rows:
+        key = (row["version"], row["ticket_no"])
+        other_codes.setdefault(key, Counter())[row["part_code"]] = row["row_count"]
+
+    conflicts = set()
+    for (version, ticket_no), station_counts in other_stations.items():
+        other = packing.detail_fingerprint_from_counts(
+            station_counts, other_codes.get((version, ticket_no))
+        )
+        submitted = packing.detail_fingerprint_from_counts(
+            stations[ticket_no], codes.get(ticket_no)
+        )
+        if other != submitted:
+            conflicts.add((ticket_no, batch_by_version[version]))
+    return sorted(conflicts)
+
+
 def publish(
     conn: sqlite3.Connection,
     batch_id: str,
@@ -65,6 +186,13 @@ def publish(
     batch's previous manifest stays current. The version grows with each
     successful publish in the batch, allowing resubmission of both tables and
     the limit.
+
+    Before writing, ticket numbers shared with any other batch's current
+    manifest are reconciled. A shared ticket number whose downloaded detail
+    would differ raises :class:`DetailConflict`, which aborts the transaction,
+    so the rejected batch keeps its previous manifest and every other batch
+    stays untouched. Ticket numbers not present in another batch are never
+    compared.
     """
     tickets = packing.parse_tickets(ticket_bytes)
     parts = packing.parse_parts(part_bytes)
@@ -73,6 +201,10 @@ def publish(
     packages = packing.plan(tickets, parts, row_limit)
 
     with db_transaction(conn):
+        conflicts = _reconcile(conn, batch_id, tickets, parts)
+        if conflicts:
+            raise DetailConflict(conflicts)
+
         seq = conn.execute(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM manifests WHERE batch_id = ?",
             (batch_id,),
